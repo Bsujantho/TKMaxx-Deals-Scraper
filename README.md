@@ -1,6 +1,6 @@
-# TK Maxx Best Deals Scraper
+# TK Maxx Deals Scraper
 
-TK Maxx UK deal scraper that uses the site's Bloomreach product index instead of browser automation. It searches a set of TK Maxx queries, reads product price/RRP data, computes percentage discounts, and exports the best deal found for each brand.
+TK Maxx UK deal scraper that uses the site's Bloomreach product index instead of browser automation. It searches a set of TK Maxx queries, reads product price/RRP data, computes percentage discounts, and exports product deal data.
 
 ## Setup
 
@@ -13,7 +13,7 @@ pip install -r requirements.txt
 ## Run
 
 ```powershell
-python tkmaxx_deals.py --output tkmaxx_best_deals.xlsx
+python tkmaxx_deals.py --output tkmaxx_deals.xlsx
 ```
 
 For a faster smoke test:
@@ -26,7 +26,27 @@ Useful options:
 
 - `--query TERM` can be repeated to scrape specific searches.
 - `--output results.csv` writes CSV instead of Excel.
+- `--export-mode all` exports every unique product found. This is the default.
+- `--export-mode best-by-brand` exports only the highest-discounted product for each brand.
 - `--rows-per-page`, `--max-pages`, `--max-products-per-query`, and `--request-delay` tune API pagination.
+
+## Export Modes
+
+The default export now writes every unique product found:
+
+```powershell
+python tkmaxx_deals.py --query men --max-pages 30 --export-mode all
+```
+
+If the log says `Found 3000 products for 'men'`, this mode writes those 3,000 unique products to the spreadsheet.
+
+To create the smaller summary that keeps only one best discounted item per brand, run:
+
+```powershell
+python tkmaxx_deals.py --query men --max-pages 30 --export-mode best-by-brand --output tkmaxx_best_deals.xlsx
+```
+
+In best-by-brand mode, a log like `Wrote 456 best brand deals from 3000 unique products` means the scraper found 3,000 products but grouped them by brand and kept only the top discounted item from each brand.
 
 ## Product Limits
 
@@ -54,7 +74,7 @@ You can also use `--max-products-per-query` when you want a smaller fixed cap fo
 python tkmaxx_deals.py --query gucci --max-products-per-query 50
 ```
 
-The exported spreadsheet is not a dump of every product found. The scraper collects products from the selected queries, then keeps the single best discounted item for each brand. That means the final Excel file can have far fewer rows than the number of products scraped.
+The number of rows in the exported spreadsheet also depends on `--export-mode`. Use `--export-mode all` when you want every product, and `--export-mode best-by-brand` when you want one deal per brand.
 
 ## Default Queries
 

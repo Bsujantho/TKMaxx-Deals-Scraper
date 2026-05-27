@@ -97,6 +97,15 @@ def find_best_deals_by_brand(items: Iterable[Product]) -> list[Product]:
     return sorted(best.values(), key=_deal_rank, reverse=True)
 
 
+def select_products_for_export(products: list[Product], export_mode: str) -> list[Product]:
+    """Return products in the requested export shape."""
+    if export_mode == "all":
+        return sorted(products, key=_deal_rank, reverse=True)
+    if export_mode == "best-by-brand":
+        return find_best_deals_by_brand(products)
+    raise ValueError(f"Unsupported export mode: {export_mode}")
+
+
 def scrape_query(
     session: requests.Session,
     query: str,
@@ -280,8 +289,7 @@ def write_products(products: list[Product], output_path: Path) -> None:
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Search TK Maxx UK's product index and export the best discount found "
-            "for each brand."
+            "Search TK Maxx UK's product index and export product deal data."
         )
     )
     parser.add_argument(
@@ -298,8 +306,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     )
     parser.add_argument(
         "--output",
-        default="tkmaxx_best_deals.xlsx",
+        default="tkmaxx_deals.xlsx",
         help="Output file path. Use .xlsx or .csv.",
+    )
+    parser.add_argument(
+        "--export-mode",
+        default="all",
+        choices=["all", "best-by-brand"],
+        help=(
+            "Choose `all` to export every unique product found, or `best-by-brand` "
+            "to export only the highest-discounted product per brand."
+        ),
     )
     parser.add_argument(
         "--rows-per-page",
@@ -354,15 +371,18 @@ def main(argv: list[str] | None = None) -> int:
         request_delay=args.request_delay,
         max_products_per_query=args.max_products_per_query,
     )
-    best_deals = find_best_deals_by_brand(products)
+    export_products = select_products_for_export(products, args.export_mode)
     output_path = Path(args.output)
-    write_products(best_deals, output_path)
-    LOGGER.info(
-        "Wrote %s best brand deals from %s unique products to %s",
-        len(best_deals),
-        len(products),
-        output_path,
-    )
+    write_products(export_products, output_path)
+    if args.export_mode == "best-by-brand":
+        LOGGER.info(
+            "Wrote %s best brand deals from %s unique products to %s",
+            len(export_products),
+            len(products),
+            output_path,
+        )
+    else:
+        LOGGER.info("Wrote all %s unique products to %s", len(export_products), output_path)
     return 0
 
 

@@ -1,6 +1,12 @@
 import unittest
 
-from tkmaxx_deals import Product, compute_discount, find_best_deals_by_brand, product_from_bloomreach_doc
+from tkmaxx_deals import (
+    Product,
+    compute_discount,
+    find_best_deals_by_brand,
+    product_from_bloomreach_doc,
+    select_products_for_export,
+)
 
 
 class PriceParsingTests(unittest.TestCase):
@@ -44,18 +50,31 @@ class PriceParsingTests(unittest.TestCase):
 
 
 class DealSelectionTests(unittest.TestCase):
-    def test_find_best_deal_per_brand(self) -> None:
-        products = [
+    def setUp(self) -> None:
+        self.products = [
             Product("Brand A", "Small discount", 90.0, 100.0, 10.0, "https://example/a", "1", "q"),
             Product("Brand A", "Big discount", 40.0, 100.0, 60.0, "https://example/b", "2", "q"),
             Product("Brand B", "No RRP", 25.0, None, None, "https://example/c", "3", "q"),
             Product("Brand C", "Deal", 50.0, 100.0, 50.0, "https://example/d", "4", "q"),
         ]
 
-        result = find_best_deals_by_brand(products)
+    def test_find_best_deal_per_brand(self) -> None:
+        result = find_best_deals_by_brand(self.products)
 
         self.assertEqual([item.brand for item in result], ["Brand A", "Brand C"])
         self.assertEqual(result[0].name, "Big discount")
+
+    def test_select_all_products_for_export(self) -> None:
+        result = select_products_for_export(self.products, "all")
+
+        self.assertEqual(len(result), 4)
+        self.assertEqual(result[0].name, "Big discount")
+        self.assertEqual(result[-1].name, "No RRP")
+
+    def test_select_best_by_brand_for_export(self) -> None:
+        result = select_products_for_export(self.products, "best-by-brand")
+
+        self.assertEqual([item.brand for item in result], ["Brand A", "Brand C"])
 
 
 if __name__ == "__main__":
