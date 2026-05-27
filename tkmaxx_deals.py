@@ -3,67 +3,62 @@ from __future__ import annotations
 import argparse
 import csv
 import logging
-import re
 import sys
 import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 from typing import Any, Iterable
+from urllib.parse import urljoin
+
+import requests
 
 
 LOGGER = logging.getLogger("tkmaxx_deals")
 
-DEFAULT_CATEGORIES = [
-    "https://www.tkmaxx.com/uk/en/women/women-view-all/c/01000001",
-    "https://www.tkmaxx.com/uk/en/men/men-view-all/c/02000001",
-    "https://www.tkmaxx.com/uk/en/kids%2Btoys/kids-baby%2Btoys-view-all/c/03000001",
-    "https://www.tkmaxx.com/uk/en/home/home/c/04000001",
-    "https://www.tkmaxx.com/uk/en/clearance/view-all-clearance/c/05010001",
+TKMAXX_BASE_URL = "https://www.tkmaxx.com/uk/en/"
+BLOOMREACH_SEARCH_URL = "https://core.dxpapi.com/api/v1/core/"
+BLOOMREACH_ACCOUNT_ID = "7256"
+BLOOMREACH_CATALOG_VIEWS = "tkmaxx:tkmaxx-uk"
+
+DEFAULT_QUERIES = [
+    "women",
+    "men",
+    "kids",
+    "toys",
+    "home",
+    "beauty",
+    "clearance",
+    "shoes",
+    "designer",
 ]
 
-PRICE_RE = re.compile(r"\u00a3\s*([0-9]+(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)")
-
-PRODUCT_TILE_SELECTORS = [
-    "a.c-product-card",
-    "li.c-product-grid__item",
-    "article",
-    "li[class*='product' i]",
-    "[class*='product-grid__item' i]",
-    "div[class*='product-tile' i]",
-    "div[class*='productTile' i]",
-    "div[class*='product-card' i]",
-    "div[class*='productCard' i]",
-    "[data-testid*='product' i]",
-    "[data-test*='product' i]",
-]
-
-BRAND_SELECTORS = [
-    "[data-testid*='brand' i]",
-    "[data-test*='brand' i]",
-    ".product-brand",
-    "[class*='brand' i]",
-]
-
-NAME_SELECTORS = [
-    "[data-testid*='name' i]",
-    "[data-test*='name' i]",
-    ".product-name",
-    "[class*='name' i]",
-    "a[title]",
-]
-
-PRICE_SELECTORS = [
-    "[data-testid*='price' i]",
-    "[data-test*='price' i]",
-    ".product-price",
-    "[class*='price' i]",
-]
-
-COOKIE_BUTTON_SELECTORS = [
-    "#onetrust-accept-btn-handler",
-    "button[id*='accept' i]",
-    "button[aria-label*='accept' i]",
-]
+BLOOMREACH_FIELDS = ",".join(
+    [
+        "pid",
+        "code",
+        "title",
+        "url",
+        "brand",
+        "price",
+        "fmt_price",
+        "rrp",
+        "fmt_rrp",
+        "save_price",
+        "fmt_save_price",
+        "percent_saving",
+        "was_price",
+        "fmt_was_price",
+        "stock",
+        "stock_status",
+        "is_low_stock",
+        "thumb_image",
+        "environment",
+        "mh_dept",
+        "mh_dept_name",
+        "mh_class",
+        "mh_class_name",
+    ]
+)
 
 
 @dataclass(slots=True)
@@ -74,30 +69,13 @@ class Product:
     original_price: float | None
     discount_pct: float | None
     url: str
-    category_url: str
-
-
-def parse_prices(text: str) -> tuple[float | None, float | None]:
-    """
-    Extract sale and original prices from a TK Maxx price string.
-
-    Common examples include "RRP GBP100 GBP39.99" and "GBP24.99".
-    In the source text those GBP examples are the pound sign. If multiple
-    prices exist, the scraper treats the first as the original price and the
-    last as the sale price, then corrects obviously reversed values.
-    """
-    amounts = [float(match.replace(",", "")) for match in PRICE_RE.findall(text)]
-    if not amounts:
-        return None, None
-    if len(amounts) == 1:
-        return amounts[0], None
-
-    original = amounts[0]
-    sale = amounts[-1]
-    if original < sale:
-        sale = min(amounts)
-        original = max(amounts)
-    return sale, original
+    product_id: str
+    source_query: str
+    stock: float | None = None
+    stock_status: str | None = None
+    department: str | None = None
+    product_class: str | None = None
+    image_url: str | None = None
 
 
 def compute_discount(sale: float | None, original: float | None) -> float | None:
@@ -119,244 +97,157 @@ def find_best_deals_by_brand(items: Iterable[Product]) -> list[Product]:
     return sorted(best.values(), key=_deal_rank, reverse=True)
 
 
-def build_driver(headless: bool) -> Any:
-    try:
-        from selenium import webdriver
-        from selenium.webdriver.chrome.options import Options
-    except ImportError as exc:
-        raise SystemExit(
-            "Selenium is required to scrape TK Maxx. Install dependencies with "
-            "`pip install -r requirements.txt`."
-        ) from exc
-
-    chrome_opts = Options()
-    if headless:
-        chrome_opts.add_argument("--headless=new")
-    chrome_opts.add_argument("--window-size=1440,1600")
-    chrome_opts.add_argument("--disable-dev-shm-usage")
-    chrome_opts.add_argument("--no-sandbox")
-    chrome_opts.add_argument("--log-level=3")
-    return webdriver.Chrome(options=chrome_opts)
-
-
-def scrape_category(
-    driver: Any,
-    url: str,
+def scrape_query(
+    session: requests.Session,
+    query: str,
     *,
-    timeout: float,
-    scroll_pause: float,
-    max_scrolls: int,
-    page_attempts: int,
+    rows_per_page: int,
+    max_pages: int,
+    request_delay: float,
     max_products: int | None = None,
 ) -> list[Product]:
-    """Load one category page, scroll lazy content into view, and parse products."""
-    for attempt in range(1, page_attempts + 1):
-        driver.get(url)
-        time.sleep(1.0)
-        accept_cookie_banner(driver)
-        try:
-            wait_for_candidate_tiles(driver, timeout=timeout)
-            break
-        except RuntimeError:
-            if attempt >= page_attempts:
-                raise
-            LOGGER.warning(
-                "TK Maxx returned an error page for %s; retrying (%s/%s)",
-                url,
-                attempt,
-                page_attempts,
-            )
-            time.sleep(2.0 * attempt)
-
-    scroll_through_page(driver, pause=scroll_pause, max_scrolls=max_scrolls)
-
+    """Search TK Maxx's Bloomreach index for one query and return products."""
     products: list[Product] = []
-    seen_urls: set[str] = set()
-    for tile in find_candidate_tiles(driver):
-        product = parse_product_tile(tile, category_url=url)
-        if product is None or product.url in seen_urls:
-            continue
-        seen_urls.add(product.url)
-        products.append(product)
-        if max_products is not None and len(products) >= max_products:
+    seen_ids: set[str] = set()
+    page = 0
+    total_found: int | None = None
+
+    while max_pages <= 0 or page < max_pages:
+        start = page * rows_per_page
+        data = fetch_bloomreach_page(
+            session,
+            query,
+            start=start,
+            rows=rows_per_page,
+        )
+        response = data.get("response", {})
+        docs = response.get("docs") or []
+        total_found = _safe_int(response.get("numFound"), default=total_found)
+
+        if not docs:
             break
+
+        for doc in docs:
+            product = product_from_bloomreach_doc(doc, source_query=query)
+            if product is None or product.product_id in seen_ids:
+                continue
+            seen_ids.add(product.product_id)
+            products.append(product)
+            if max_products is not None and len(products) >= max_products:
+                return products
+
+        page += 1
+        if total_found is not None and page * rows_per_page >= total_found:
+            break
+        if request_delay > 0:
+            time.sleep(request_delay)
+
     return products
 
 
-def accept_cookie_banner(driver: Any) -> None:
-    from selenium.webdriver.common.by import By
-
-    for selector in COOKIE_BUTTON_SELECTORS:
-        for button in driver.find_elements(By.CSS_SELECTOR, selector):
-            try:
-                if button.is_displayed() and button.is_enabled():
-                    button.click()
-                    time.sleep(0.5)
-                    return
-            except Exception:
-                continue
-
-
-def wait_for_candidate_tiles(driver: Any, *, timeout: float) -> None:
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if is_tkmaxx_error_page(driver):
-            raise RuntimeError(
-                "TK Maxx returned its 'Something went wrong' page. Retry later; "
-                "if you used --headless, run again without it."
-            )
-        if find_candidate_tiles(driver):
-            return
-        time.sleep(0.5)
-    LOGGER.warning("No product tiles found before timeout on %s", driver.current_url)
-
-
-def is_tkmaxx_error_page(driver: Any) -> bool:
-    from selenium.webdriver.common.by import By
-
-    try:
-        body_text = " ".join(
-            normalized_text(driver.find_element(By.TAG_NAME, "body")).lower().split()
-        )
-    except Exception:
-        return False
-    return "something went wrong" in body_text and "shop tkmaxx online" in body_text
+def fetch_bloomreach_page(
+    session: requests.Session,
+    query: str,
+    *,
+    start: int,
+    rows: int,
+) -> dict[str, Any]:
+    params = {
+        "account_id": BLOOMREACH_ACCOUNT_ID,
+        "catalog_views": BLOOMREACH_CATALOG_VIEWS,
+        "request_type": "search",
+        "search_type": "keyword",
+        "q": query,
+        "rows": str(rows),
+        "start": str(start),
+        "url": f"{TKMAXX_BASE_URL}search?st={query}",
+        "ref_url": TKMAXX_BASE_URL,
+        "fl": BLOOMREACH_FIELDS,
+    }
+    response = session.get(BLOOMREACH_SEARCH_URL, params=params, timeout=30)
+    response.raise_for_status()
+    data = response.json()
+    if "response" not in data:
+        raise RuntimeError(f"Unexpected Bloomreach response for query {query!r}: {data}")
+    return data
 
 
-def scroll_through_page(driver: Any, *, pause: float, max_scrolls: int) -> None:
-    last_height = 0
-    last_count = 0
-    stable_rounds = 0
-
-    for _ in range(max_scrolls):
-        driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
-        time.sleep(pause)
-        height = int(driver.execute_script("return document.body.scrollHeight") or 0)
-        count = len(find_candidate_tiles(driver))
-
-        if height == last_height and count == last_count:
-            stable_rounds += 1
-            if stable_rounds >= 2:
-                break
-        else:
-            stable_rounds = 0
-
-        last_height = height
-        last_count = count
-
-
-def find_candidate_tiles(driver: Any) -> list[Any]:
-    from selenium.webdriver.common.by import By
-
-    candidates: list[Any] = []
-    seen_ids: set[str] = set()
-    for selector in PRODUCT_TILE_SELECTORS:
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, selector)
-        except Exception:
-            continue
-        for element in elements:
-            element_id = getattr(element, "id", "")
-            if element_id in seen_ids or not looks_like_product_tile(element):
-                continue
-            seen_ids.add(element_id)
-            candidates.append(element)
-    return candidates
-
-
-def looks_like_product_tile(element: Any) -> bool:
-    text = normalized_text(element)
-    if "\u00a3" not in text:
-        return False
-    return first_product_link(element) is not None
-
-
-def parse_product_tile(tile: Any, *, category_url: str) -> Product | None:
-    price_text = extract_first_text(tile, PRICE_SELECTORS) or normalized_text(tile)
-    sale_price, original_price = parse_prices(price_text)
-    if sale_price is None:
+def product_from_bloomreach_doc(doc: dict[str, Any], *, source_query: str) -> Product | None:
+    product_id = str(doc.get("pid") or doc.get("code") or "").strip()
+    name = str(doc.get("title") or "").strip()
+    brand = str(doc.get("brand") or "").strip()
+    if not product_id or not name:
         return None
+    if not brand or brand.lower() == "unbranded":
+        brand = "Unbranded"
 
-    url = first_product_link(tile)
-    if not url:
-        return None
+    sale_price = _safe_float(doc.get("price"))
+    original_price = _safe_float(doc.get("rrp"))
+    discount = _safe_float(doc.get("percent_saving"))
+    if discount is None:
+        discount = compute_discount(sale_price, original_price)
 
-    brand = extract_first_text(tile, BRAND_SELECTORS)
-    name = extract_first_text(tile, NAME_SELECTORS)
-    fallback_brand, fallback_name = infer_brand_and_name_from_tile(tile)
-    brand = brand or fallback_brand
-    name = name or fallback_name
-
-    if not brand or not name:
-        return None
+    relative_url = str(doc.get("url") or "").strip()
+    product_url = urljoin(TKMAXX_BASE_URL, relative_url.lstrip("/"))
 
     return Product(
         brand=brand,
         name=name,
         sale_price=sale_price,
         original_price=original_price,
-        discount_pct=compute_discount(sale_price, original_price),
-        url=url,
-        category_url=category_url,
+        discount_pct=round(discount, 2) if discount is not None else None,
+        url=product_url,
+        product_id=product_id,
+        source_query=source_query,
+        stock=_safe_float(doc.get("stock")),
+        stock_status=_safe_str(doc.get("stock_status")),
+        department=_clean_taxonomy_label(doc.get("mh_dept_name")),
+        product_class=_clean_taxonomy_label(doc.get("mh_class_name")),
+        image_url=_safe_str(doc.get("thumb_image")),
     )
 
 
-def extract_first_text(element: Any, selectors: list[str]) -> str | None:
-    from selenium.webdriver.common.by import By
+def scrape_queries(
+    queries: Iterable[str],
+    *,
+    rows_per_page: int,
+    max_pages: int,
+    request_delay: float,
+    max_products_per_query: int | None,
+) -> list[Product]:
+    session = requests.Session()
+    session.headers.update(
+        {
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+            ),
+            "Accept": "application/json",
+        }
+    )
 
-    for selector in selectors:
-        try:
-            children = element.find_elements(By.CSS_SELECTOR, selector)
-        except Exception:
+    all_products: list[Product] = []
+    seen_ids: set[str] = set()
+    for query in queries:
+        query = query.strip()
+        if not query:
             continue
-        for child in children:
-            text = normalized_text(child) or child.get_attribute("title") or ""
-            text = " ".join(text.split())
-            if text and "\u00a3" not in text:
-                return text
-    return None
-
-
-def infer_brand_and_name_from_tile(tile: Any) -> tuple[str | None, str | None]:
-    lines = [
-        " ".join(line.split())
-        for line in normalized_text(tile).splitlines()
-        if line.strip()
-    ]
-    non_price_lines = [
-        line
-        for line in lines
-        if "\u00a3" not in line and line.lower() not in {"quick view", "add to bag"}
-    ]
-    if not non_price_lines:
-        return None, None
-    if len(non_price_lines) == 1:
-        return non_price_lines[0], non_price_lines[0]
-    return non_price_lines[0], non_price_lines[1]
-
-
-def first_product_link(element: Any) -> str | None:
-    from selenium.webdriver.common.by import By
-
-    if getattr(element, "tag_name", "").lower() == "a":
-        href = element.get_attribute("href")
-        if href and not href.startswith(("javascript:", "#")):
-            return href
-
-    fallback: str | None = None
-    for link in element.find_elements(By.CSS_SELECTOR, "a[href]"):
-        href = link.get_attribute("href")
-        if not href or href.startswith(("javascript:", "#")):
-            continue
-        if "/p/" in href:
-            return href
-        if fallback is None and "tkmaxx.com/uk/en/" in href:
-            fallback = href
-    return fallback
-
-
-def normalized_text(element: Any) -> str:
-    return (getattr(element, "text", "") or "").strip()
+        LOGGER.info("Searching %r", query)
+        products = scrape_query(
+            session,
+            query,
+            rows_per_page=rows_per_page,
+            max_pages=max_pages,
+            request_delay=request_delay,
+            max_products=max_products_per_query,
+        )
+        LOGGER.info("Found %s products for %r", len(products), query)
+        for product in products:
+            if product.product_id in seen_ids:
+                continue
+            seen_ids.add(product.product_id)
+            all_products.append(product)
+    return all_products
 
 
 def write_products(products: list[Product], output_path: Path) -> None:
@@ -388,60 +279,51 @@ def write_products(products: list[Product], output_path: Path) -> None:
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Scrape TK Maxx UK category pages and export the best discount per brand."
+        description=(
+            "Search TK Maxx UK's product index and export the best discount found "
+            "for each brand."
+        )
+    )
+    parser.add_argument(
+        "--query",
+        action="append",
+        dest="queries",
+        help="Search query to scrape. Repeat to add multiple searches.",
     )
     parser.add_argument(
         "--category",
         action="append",
         dest="categories",
-        help="Category URL to scrape. Repeat to add multiple categories.",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument(
         "--output",
         default="tkmaxx_best_deals.xlsx",
         help="Output file path. Use .xlsx or .csv.",
     )
-    browser_group = parser.add_mutually_exclusive_group()
-    browser_group.add_argument(
-        "--headless",
-        action="store_true",
-        help="Run Chrome headless. TK Maxx may serve an error page in this mode.",
-    )
-    browser_group.add_argument(
-        "--headful",
-        action="store_false",
-        dest="headless",
-        help=argparse.SUPPRESS,
+    parser.add_argument(
+        "--rows-per-page",
+        type=int,
+        default=100,
+        help="Bloomreach rows to request per page.",
     )
     parser.add_argument(
-        "--max-products-per-category",
+        "--max-pages",
+        type=int,
+        default=5,
+        help="Maximum pages to request for each query. Use 0 for all pages.",
+    )
+    parser.add_argument(
+        "--max-products-per-query",
         type=int,
         default=None,
-        help="Optional cap for faster test runs.",
+        help="Optional product cap per query for smoke tests.",
     )
     parser.add_argument(
-        "--max-scrolls",
-        type=int,
-        default=30,
-        help="Maximum lazy-load scroll attempts per category.",
-    )
-    parser.add_argument(
-        "--scroll-pause",
+        "--request-delay",
         type=float,
-        default=1.5,
-        help="Seconds to wait after each scroll.",
-    )
-    parser.add_argument(
-        "--timeout",
-        type=float,
-        default=20.0,
-        help="Seconds to wait for product tiles after opening each page.",
-    )
-    parser.add_argument(
-        "--page-attempts",
-        type=int,
-        default=3,
-        help="Number of attempts per category when TK Maxx returns a transient error page.",
+        default=0.25,
+        help="Seconds to wait between paged API requests.",
     )
     parser.add_argument(
         "--log-level",
@@ -459,36 +341,84 @@ def main(argv: list[str] | None = None) -> int:
         format="%(levelname)s: %(message)s",
     )
 
-    categories = args.categories or DEFAULT_CATEGORIES
-    driver = build_driver(headless=args.headless)
+    if args.rows_per_page <= 0:
+        raise SystemExit("--rows-per-page must be greater than 0")
+    if args.max_pages < 0:
+        raise SystemExit("--max-pages must be 0 or greater")
 
-    collected: list[Product] = []
-    try:
-        for category_url in categories:
-            LOGGER.info("Scraping %s", category_url)
-            try:
-                products = scrape_category(
-                    driver,
-                    category_url,
-                    timeout=args.timeout,
-                    scroll_pause=args.scroll_pause,
-                    max_scrolls=args.max_scrolls,
-                    page_attempts=args.page_attempts,
-                    max_products=args.max_products_per_category,
-                )
-            except Exception:
-                LOGGER.exception("Failed to scrape %s", category_url)
-                continue
-            LOGGER.info("Found %s products", len(products))
-            collected.extend(products)
-    finally:
-        driver.quit()
-
-    best_deals = find_best_deals_by_brand(collected)
+    queries = args.queries or _queries_from_legacy_categories(args.categories) or DEFAULT_QUERIES
+    products = scrape_queries(
+        queries,
+        rows_per_page=args.rows_per_page,
+        max_pages=args.max_pages,
+        request_delay=args.request_delay,
+        max_products_per_query=args.max_products_per_query,
+    )
+    best_deals = find_best_deals_by_brand(products)
     output_path = Path(args.output)
     write_products(best_deals, output_path)
-    LOGGER.info("Wrote %s best deals to %s", len(best_deals), output_path)
+    LOGGER.info(
+        "Wrote %s best brand deals from %s unique products to %s",
+        len(best_deals),
+        len(products),
+        output_path,
+    )
     return 0
+
+
+def _queries_from_legacy_categories(categories: list[str] | None) -> list[str]:
+    if not categories:
+        return []
+    queries: list[str] = []
+    for category in categories:
+        normalized = category.lower()
+        if "women" in normalized:
+            queries.append("women")
+        elif "men" in normalized:
+            queries.append("men")
+        elif "kids" in normalized or "toys" in normalized:
+            queries.append("kids")
+        elif "home" in normalized:
+            queries.append("home")
+        elif "clearance" in normalized:
+            queries.append("clearance")
+        else:
+            queries.append(category)
+    return queries
+
+
+def _clean_taxonomy_label(value: Any) -> str | None:
+    text = _safe_str(value)
+    if not text:
+        return None
+    if ":" in text:
+        return text.split(":", 1)[1].strip()
+    return text
+
+
+def _safe_float(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_int(value: Any, *, default: int | None = None) -> int | None:
+    if value is None or value == "":
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_str(value: Any) -> str | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text or None
 
 
 def _deal_rank(item: Product) -> tuple[float, float, float]:

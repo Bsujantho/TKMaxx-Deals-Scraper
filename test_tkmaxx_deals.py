@@ -1,38 +1,55 @@
 import unittest
 
-from tkmaxx_deals import Product, compute_discount, find_best_deals_by_brand, parse_prices
+from tkmaxx_deals import Product, compute_discount, find_best_deals_by_brand, product_from_bloomreach_doc
 
 
 class PriceParsingTests(unittest.TestCase):
-    def test_parse_single_price(self) -> None:
-        self.assertEqual(parse_prices("\u00a324.99"), (24.99, None))
-
-    def test_parse_rrp_then_sale(self) -> None:
-        self.assertEqual(parse_prices("RRP \u00a3100 \u00a339.99"), (39.99, 100.0))
-
-    def test_parse_was_then_now_with_commas(self) -> None:
-        self.assertEqual(
-            parse_prices("Was \u00a31,200.00 Now \u00a3899.50"),
-            (899.5, 1200.0),
-        )
-
-    def test_parse_reversed_prices(self) -> None:
-        self.assertEqual(parse_prices("Now \u00a339.99 RRP \u00a3100"), (39.99, 100.0))
-
     def test_compute_discount(self) -> None:
         self.assertEqual(compute_discount(39.99, 100.0), 60.01)
         self.assertIsNone(compute_discount(None, 100.0))
         self.assertIsNone(compute_discount(10.0, None))
         self.assertIsNone(compute_discount(10.0, 0.0))
 
+    def test_product_from_bloomreach_doc(self) -> None:
+        product = product_from_bloomreach_doc(
+            {
+                "pid": "13028706",
+                "title": "Black GG1081S 001 Oversized Sunglasses",
+                "brand": "Gucci",
+                "price": 99.99,
+                "rrp": 350.0,
+                "percent_saving": 71,
+                "url": "/women/sunglasses/p/13028706",
+                "stock": 1421,
+                "stock_status": "inStock",
+                "mh_dept_name": "Department: 013 SUNGLASSES & OPTICALS",
+                "mh_class_name": "Class: 80 GOLD LABEL",
+                "thumb_image": "https://example.com/product.jpg",
+            },
+            source_query="gucci",
+        )
+
+        self.assertIsNotNone(product)
+        assert product is not None
+        self.assertEqual(product.brand, "Gucci")
+        self.assertEqual(product.sale_price, 99.99)
+        self.assertEqual(product.original_price, 350.0)
+        self.assertEqual(product.discount_pct, 71)
+        self.assertEqual(product.department, "013 SUNGLASSES & OPTICALS")
+        self.assertEqual(product.product_class, "80 GOLD LABEL")
+        self.assertEqual(
+            product.url,
+            "https://www.tkmaxx.com/uk/en/women/sunglasses/p/13028706",
+        )
+
 
 class DealSelectionTests(unittest.TestCase):
     def test_find_best_deal_per_brand(self) -> None:
         products = [
-            Product("Brand A", "Small discount", 90.0, 100.0, 10.0, "https://example/a", "cat"),
-            Product("Brand A", "Big discount", 40.0, 100.0, 60.0, "https://example/b", "cat"),
-            Product("Brand B", "No RRP", 25.0, None, None, "https://example/c", "cat"),
-            Product("Brand C", "Deal", 50.0, 100.0, 50.0, "https://example/d", "cat"),
+            Product("Brand A", "Small discount", 90.0, 100.0, 10.0, "https://example/a", "1", "q"),
+            Product("Brand A", "Big discount", 40.0, 100.0, 60.0, "https://example/b", "2", "q"),
+            Product("Brand B", "No RRP", 25.0, None, None, "https://example/c", "3", "q"),
+            Product("Brand C", "Deal", 50.0, 100.0, 50.0, "https://example/d", "4", "q"),
         ]
 
         result = find_best_deals_by_brand(products)
